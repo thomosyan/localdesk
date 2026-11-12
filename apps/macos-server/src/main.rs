@@ -22,6 +22,9 @@ use std::sync::Arc;
 use std::thread;
 #[cfg(target_os = "macos")]
 use tracing::{info, warn};
+
+#[cfg(target_os = "macos")]
+pub mod encoder;
 #[derive(Debug, Parser)]
 #[command(
     name = "localdesk-server",
