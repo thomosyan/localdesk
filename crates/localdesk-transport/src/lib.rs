@@ -11,7 +11,10 @@ pub async fn send_rtp(socket: &UdpSocket, target: &str, packet: &RtpPacket) -> R
     Ok(socket.send_to(&packet.encode(), target).await?)
 }
 
-pub async fn receive_rtp(socket: &UdpSocket, buffer: &mut [u8]) -> Result<(RtpPacket, std::net::SocketAddr)> {
+pub async fn receive_rtp(
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+) -> Result<(RtpPacket, std::net::SocketAddr)> {
     let (size, peer) = socket.recv_from(buffer).await?;
     let packet = RtpPacket::decode(&buffer[..size])?;
     Ok((packet, peer))

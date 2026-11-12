@@ -3,21 +3,31 @@
 //! This first native milestone validates ScreenCaptureKit acquisition only.
 //! It intentionally does not encode or transmit frames yet.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
-use screencapturekit::stream::{
-    output_trait::SCStreamOutputTrait,
-    output_type::SCStreamOutputType,
-};
+
+#[cfg(target_os = "macos")]
 use screencapturekit::cm::CMSampleBuffer;
+#[cfg(target_os = "macos")]
 use screencapturekit::cm::CMSampleBufferExt;
+#[cfg(target_os = "macos")]
+use screencapturekit::stream::{
+    output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType,
+};
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::thread;
+#[cfg(target_os = "macos")]
+use tracing::{info, warn};
 #[derive(Debug, Parser)]
-#[command(name = "localdesk-server", version, about = "LocalDesk native macOS screen-capture probe")]
+#[command(
+    name = "localdesk-server",
+    version,
+    about = "LocalDesk native macOS screen-capture probe"
+)]
 struct Args {
     /// Display index (0 = first display returned by ScreenCaptureKit)
     #[arg(long, default_value_t = 0)]
@@ -57,9 +67,13 @@ fn main() -> Result<()> {
     let content = SCShareableContent::get()
         .context("ScreenCaptureKit could not enumerate displays. Check Screen Recording permission and restart the app.")?;
     let displays = content.displays();
-    let display = displays
-        .get(args.display)
-        .with_context(|| format!("Display index {} does not exist; {} display(s) found", args.display, displays.len()))?;
+    let display = displays.get(args.display).with_context(|| {
+        format!(
+            "Display index {} does not exist; {} display(s) found",
+            args.display,
+            displays.len()
+        )
+    })?;
 
     let filter = SCContentFilter::create()
         .with_display(display)
@@ -78,10 +92,12 @@ fn main() -> Result<()> {
         .with_minimum_frame_interval(&frame_interval);
 
     let stats = Arc::new(CaptureStats::default());
-    let handler = FrameHandler { stats: Arc::clone(&stats) };
+    let handler = FrameHandler {
+        stats: Arc::clone(&stats),
+    };
 
-    let mut stream = SCStream::new(&filter, &config)
-        .context("Failed to create ScreenCaptureKit stream")?;
+    let mut stream =
+        SCStream::new(&filter, &config).context("Failed to create ScreenCaptureKit stream")?;
     stream
         .add_output_handler(handler, SCStreamOutputType::Screen)
         .context("Failed to register ScreenCaptureKit output handler")?;
@@ -93,9 +109,13 @@ fn main() -> Result<()> {
         requested_fps = args.fps,
         "Starting native screen capture"
     );
-    info!("Grant Screen Recording to the LocalDesk binary (or Terminal during development) if macOS asks.");
+    info!(
+        "Grant Screen Recording to the LocalDesk binary (or Terminal during development) if macOS asks."
+    );
 
-    stream.start_capture().context("ScreenCaptureKit failed to start capture")?;
+    stream
+        .start_capture()
+        .context("ScreenCaptureKit failed to start capture")?;
 
     let started = Instant::now();
     let mut last_report = Instant::now();
@@ -105,10 +125,18 @@ fn main() -> Result<()> {
         let elapsed = started.elapsed();
         if last_report.elapsed() >= Duration::from_secs(1) {
             let total = stats.frames.load(Ordering::Relaxed);
-            let fps = total.saturating_sub(last_frames) as f64 / last_report.elapsed().as_secs_f64();
+            let fps =
+                total.saturating_sub(last_frames) as f64 / last_report.elapsed().as_secs_f64();
             let width = stats.width.load(Ordering::Relaxed);
             let height = stats.height.load(Ordering::Relaxed);
-            info!(frames = total, measured_fps = format_args!("{fps:.1}"), width, height, elapsed_secs = elapsed.as_secs(), "Capture statistics");
+            info!(
+                frames = total,
+                measured_fps = format_args!("{fps:.1}"),
+                width,
+                height,
+                elapsed_secs = elapsed.as_secs(),
+                "Capture statistics"
+            );
             last_frames = total;
             last_report = Instant::now();
         }
@@ -117,10 +145,14 @@ fn main() -> Result<()> {
         }
     }
 
-    stream.stop_capture().context("Failed to stop ScreenCaptureKit stream")?;
+    stream
+        .stop_capture()
+        .context("Failed to stop ScreenCaptureKit stream")?;
     let total = stats.frames.load(Ordering::Relaxed);
     if total == 0 {
-        warn!("No frames received. Check System Settings → Privacy & Security → Screen & System Audio Recording, then restart the terminal/app.");
+        warn!(
+            "No frames received. Check System Settings → Privacy & Security → Screen & System Audio Recording, then restart the terminal/app."
+        );
         bail!("ScreenCaptureKit produced no frames");
     }
     info!(total_frames = total, "Capture test completed successfully");
@@ -130,7 +162,9 @@ fn main() -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn main() -> Result<()> {
     let _ = Args::parse();
-    bail!("The LocalDesk screen-capture server can only be built and run on macOS. Build the Windows client separately for Windows.")
+    bail!(
+        "The LocalDesk screen-capture server can only be built and run on macOS. Build the Windows client separately for Windows."
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -154,8 +188,12 @@ impl SCStreamOutputTrait for FrameHandler {
             _ => return,
         }
         if let Some(pixel_buffer) = sample.pixel_buffer() {
-            self.stats.width.store(pixel_buffer.width() as u64, Ordering::Relaxed);
-            self.stats.height.store(pixel_buffer.height() as u64, Ordering::Relaxed);
+            self.stats
+                .width
+                .store(pixel_buffer.width() as u64, Ordering::Relaxed);
+            self.stats
+                .height
+                .store(pixel_buffer.height() as u64, Ordering::Relaxed);
             self.stats.frames.fetch_add(1, Ordering::Relaxed);
         }
     }

@@ -47,24 +47,36 @@ impl RtpPacket {
     }
 
     pub fn decode(raw: &[u8]) -> Result<Self, ProtocolError> {
-        if raw.len() < RTP_HEADER_LEN { return Err(ProtocolError::ShortRtpHeader); }
+        if raw.len() < RTP_HEADER_LEN {
+            return Err(ProtocolError::ShortRtpHeader);
+        }
         let version = raw[0] >> 6;
-        if version != RTP_VERSION { return Err(ProtocolError::UnsupportedVersion(version)); }
+        if version != RTP_VERSION {
+            return Err(ProtocolError::UnsupportedVersion(version));
+        }
         let padding = (raw[0] & 0x20) != 0;
         let extension = (raw[0] & 0x10) != 0;
         let csrc_count = (raw[0] & 0x0f) as usize;
         let mut offset = RTP_HEADER_LEN + csrc_count * 4;
-        if raw.len() < offset { return Err(ProtocolError::InvalidHeaderLength); }
+        if raw.len() < offset {
+            return Err(ProtocolError::InvalidHeaderLength);
+        }
         if extension {
-            if raw.len() < offset + 4 { return Err(ProtocolError::InvalidHeaderLength); }
+            if raw.len() < offset + 4 {
+                return Err(ProtocolError::InvalidHeaderLength);
+            }
             let words = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]) as usize;
             offset += 4 + words * 4;
-            if raw.len() < offset { return Err(ProtocolError::InvalidHeaderLength); }
+            if raw.len() < offset {
+                return Err(ProtocolError::InvalidHeaderLength);
+            }
         }
         let mut end = raw.len();
         if padding {
             let pad = *raw.last().ok_or(ProtocolError::InvalidHeaderLength)? as usize;
-            if pad == 0 || pad > end.saturating_sub(offset) { return Err(ProtocolError::InvalidHeaderLength); }
+            if pad == 0 || pad > end.saturating_sub(offset) {
+                return Err(ProtocolError::InvalidHeaderLength);
+            }
             end -= pad;
         }
         let sequence = u16::from_be_bytes([raw[2], raw[3]]);
@@ -84,15 +96,27 @@ impl RtpPacket {
 /// Packetize one Annex-B-independent H.264 NAL unit (without 00 00 01 prefix).
 /// Uses RFC 6184 single-NAL packets or FU-A fragmentation.
 pub fn packetize_h264_nal(
-    nal: &[u8], mtu: usize, first_sequence: u16, timestamp: u32, ssrc: u32,
+    nal: &[u8],
+    mtu: usize,
+    first_sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
 ) -> Result<Vec<RtpPacket>, ProtocolError> {
-    if nal.is_empty() { return Err(ProtocolError::InvalidNal); }
-    if mtu <= RTP_HEADER_LEN + 2 { return Err(ProtocolError::MtuTooSmall); }
+    if nal.is_empty() {
+        return Err(ProtocolError::InvalidNal);
+    }
+    if mtu <= RTP_HEADER_LEN + 2 {
+        return Err(ProtocolError::MtuTooSmall);
+    }
     let max_payload = mtu - RTP_HEADER_LEN;
     if nal.len() <= max_payload {
         return Ok(vec![RtpPacket {
-            marker: true, payload_type: H264_PAYLOAD_TYPE, sequence: first_sequence,
-            timestamp, ssrc, payload: Bytes::copy_from_slice(nal),
+            marker: true,
+            payload_type: H264_PAYLOAD_TYPE,
+            sequence: first_sequence,
+            timestamp,
+            ssrc,
+            payload: Bytes::copy_from_slice(nal),
         }]);
     }
 
@@ -124,11 +148,17 @@ pub fn packetize_h264_nal(
 
 /// Reassemble one H.264 NAL from a single-NAL RTP packet or a complete FU-A run.
 pub fn depacketize_h264_nal(packets: &[RtpPacket]) -> Result<Bytes, ProtocolError> {
-    if packets.is_empty() { return Err(ProtocolError::InvalidNal); }
+    if packets.is_empty() {
+        return Err(ProtocolError::InvalidNal);
+    }
     if packets.len() == 1 {
         let p = &packets[0].payload;
-        if p.is_empty() { return Err(ProtocolError::InvalidNal); }
-        if (p[0] & 0x1f) != 28 { return Ok(p.clone()); }
+        if p.is_empty() {
+            return Err(ProtocolError::InvalidNal);
+        }
+        if (p[0] & 0x1f) != 28 {
+            return Ok(p.clone());
+        }
     }
     let first = &packets[0].payload;
     if first.len() < 3 || (first[0] & 0x1f) != 28 || (first[1] & 0x80) == 0 {
@@ -139,12 +169,20 @@ pub fn depacketize_h264_nal(packets: &[RtpPacket]) -> Result<Bytes, ProtocolErro
     out.put_u8(reconstructed_header);
     for (i, packet) in packets.iter().enumerate() {
         let p = &packet.payload;
-        if p.len() < 3 || (p[0] & 0x1f) != 28 { return Err(ProtocolError::UnsupportedH264Packet); }
+        if p.len() < 3 || (p[0] & 0x1f) != 28 {
+            return Err(ProtocolError::UnsupportedH264Packet);
+        }
         let start = (p[1] & 0x80) != 0;
         let end = (p[1] & 0x40) != 0;
-        if i == 0 && !start { return Err(ProtocolError::UnsupportedH264Packet); }
-        if i > 0 && start { return Err(ProtocolError::UnsupportedH264Packet); }
-        if end != (i == packets.len() - 1) { return Err(ProtocolError::UnsupportedH264Packet); }
+        if i == 0 && !start {
+            return Err(ProtocolError::UnsupportedH264Packet);
+        }
+        if i > 0 && start {
+            return Err(ProtocolError::UnsupportedH264Packet);
+        }
+        if end != (i == packets.len() - 1) {
+            return Err(ProtocolError::UnsupportedH264Packet);
+        }
         if i > 0 && packet.sequence != packets[i - 1].sequence.wrapping_add(1) {
             return Err(ProtocolError::UnsupportedH264Packet);
         }
@@ -159,8 +197,14 @@ mod tests {
 
     #[test]
     fn rtp_round_trip() {
-        let packet = RtpPacket { marker: true, payload_type: 96, sequence: 65530,
-            timestamp: 123456, ssrc: 42, payload: Bytes::from_static(b"hello") };
+        let packet = RtpPacket {
+            marker: true,
+            payload_type: 96,
+            sequence: 65530,
+            timestamp: 123456,
+            ssrc: 42,
+            payload: Bytes::from_static(b"hello"),
+        };
         assert_eq!(RtpPacket::decode(&packet.encode()).unwrap(), packet);
     }
 
@@ -181,3 +225,7 @@ mod tests {
         assert!(packets.last().unwrap().marker);
     }
 }
+
+mod annexb;
+
+pub use annexb::annex_b_nals;
