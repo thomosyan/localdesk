@@ -6,15 +6,22 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::thread;
+#[cfg(target_os = "macos")]
 use tracing::{info, warn};
+#[cfg(target_os = "macos")]
 use screencapturekit::stream::{
     output_trait::SCStreamOutputTrait,
     output_type::SCStreamOutputType,
 };
+#[cfg(target_os = "macos")]
 use screencapturekit::cm::CMSampleBuffer;
+#[cfg(target_os = "macos")]
 use screencapturekit::cm::CMSampleBufferExt;
 #[derive(Debug, Parser)]
 #[command(name = "localdesk-server", version, about = "LocalDesk native macOS screen-capture probe")]
