@@ -1,11 +1,12 @@
 //! LocalDesk macOS screen capture and H.264 encoding probe.
 //!
 //! Captured IOSurfaces are queued to a dedicated VideoToolbox worker. This
-//! milestone validates local capture and hardware/software H.264 encoding;
-//! it does not transmit RTP yet.
+//! milestone validates local capture, hardware/software H.264 encoding, and
+//! optional Annex-B elementary-stream recording; it does not transmit RTP yet.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,10 @@ use screencapturekit::stream::{
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
 #[cfg(target_os = "macos")]
+use std::fs::File;
+#[cfg(target_os = "macos")]
+use std::io::BufWriter;
+#[cfg(target_os = "macos")]
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
@@ -32,6 +37,8 @@ use tracing::{error, info, warn};
 
 #[cfg(target_os = "macos")]
 use crate::encoder::{H264Encoder, H264EncoderConfig};
+#[cfg(target_os = "macos")]
+use crate::h264_file::H264AnnexBWriter;
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreVideo", kind = "framework")]
@@ -42,6 +49,8 @@ unsafe extern "C" {
 
 #[cfg(target_os = "macos")]
 pub mod encoder;
+#[cfg(target_os = "macos")]
+mod h264_file;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -69,6 +78,10 @@ struct Args {
     /// Capture duration in seconds; 0 means run until Ctrl+C
     #[arg(long, default_value_t = 15)]
     seconds: u64,
+
+    /// Optional path for an Annex-B H.264 elementary stream (for example capture.h264)
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -114,10 +127,21 @@ fn main() -> Result<()> {
     let (encoder_tx, encoder_rx) = mpsc::sync_channel::<EncoderMessage>(3);
     let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
     let worker_stats = Arc::clone(&stats);
+    let output_path = args.output.clone();
 
     let encoder_worker = thread::Builder::new()
         .name("localdesk-h264-encoder".into())
         .spawn(move || -> Result<()> {
+            let mut output = match output_path {
+                Some(path) => {
+                    let file = File::create(&path)
+                        .with_context(|| format!("Could not create H.264 output file {}", path.display()))?;
+                    info!(path = %path.display(), "Recording Annex-B H.264 elementary stream");
+                    Some(H264AnnexBWriter::new(BufWriter::new(file)))
+                }
+                None => None,
+            };
+
             let encoder = match H264Encoder::new(H264EncoderConfig {
                 width: args.width,
                 height: args.height,
@@ -145,6 +169,14 @@ fn main() -> Result<()> {
                                     frame.data.len() as u64,
                                     Ordering::Relaxed,
                                 );
+
+                                if let Some(writer) = output.as_mut() {
+                                    let bytes = writer
+                                        .write_frame(&frame)
+                                        .with_context(|| format!("Failed writing encoded frame {frame_index}"))?;
+                                    worker_stats.output_frames.fetch_add(1, Ordering::Relaxed);
+                                    worker_stats.output_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                                }
                             }
                             Err(error) => {
                                 worker_stats.encode_errors.fetch_add(1, Ordering::Relaxed);
@@ -154,6 +186,10 @@ fn main() -> Result<()> {
                     }
                     EncoderMessage::Stop => break,
                 }
+            }
+
+            if let Some(writer) = output.as_mut() {
+                writer.flush()?;
             }
             Ok(())
         })
@@ -189,7 +225,11 @@ fn main() -> Result<()> {
 
     if let Err(error) = stream.start_capture() {
         let _ = encoder_tx.send(EncoderMessage::Stop);
-        let _ = encoder_worker.join();
+        drop(encoder_tx);
+        let worker_result = encoder_worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("H.264 encoder worker panicked"))?;
+        worker_result?;
         return Err(error).context("ScreenCaptureKit failed to start capture");
     }
 
@@ -210,6 +250,8 @@ fn main() -> Result<()> {
                 dropped = stats.dropped.load(Ordering::Relaxed),
                 encode_errors = stats.encode_errors.load(Ordering::Relaxed),
                 encoded_bytes = stats.encoded_bytes.load(Ordering::Relaxed),
+                output_frames = stats.output_frames.load(Ordering::Relaxed),
+                output_bytes = stats.output_bytes.load(Ordering::Relaxed),
                 measured_fps = format_args!("{fps:.1}"),
                 width = stats.width.load(Ordering::Relaxed),
                 height = stats.height.load(Ordering::Relaxed),
@@ -228,13 +270,13 @@ fn main() -> Result<()> {
         .stop_capture()
         .context("Failed to stop ScreenCaptureKit stream")?;
 
-    encoder_tx
-        .send(EncoderMessage::Stop)
-        .context("H.264 encoder worker disconnected before shutdown")?;
+    let stop_result = encoder_tx.send(EncoderMessage::Stop);
     drop(encoder_tx);
-    encoder_worker
+    let worker_result = encoder_worker
         .join()
-        .map_err(|_| anyhow::anyhow!("H.264 encoder worker panicked"))??;
+        .map_err(|_| anyhow::anyhow!("H.264 encoder worker panicked"))?;
+    stop_result.context("H.264 encoder worker disconnected before shutdown")?;
+    worker_result?;
 
     let total = stats.frames.load(Ordering::Relaxed);
     let encoded = stats.encoded.load(Ordering::Relaxed);
@@ -250,6 +292,8 @@ fn main() -> Result<()> {
         dropped_frames = stats.dropped.load(Ordering::Relaxed),
         encode_errors = stats.encode_errors.load(Ordering::Relaxed),
         encoded_bytes = stats.encoded_bytes.load(Ordering::Relaxed),
+        output_frames = stats.output_frames.load(Ordering::Relaxed),
+        output_bytes = stats.output_bytes.load(Ordering::Relaxed),
         "Capture and H.264 encoding test completed"
     );
     Ok(())
@@ -274,6 +318,8 @@ struct CaptureStats {
     dropped: AtomicU64,
     encode_errors: AtomicU64,
     encoded_bytes: AtomicU64,
+    output_frames: AtomicU64,
+    output_bytes: AtomicU64,
 }
 
 #[cfg(target_os = "macos")]
@@ -309,8 +355,7 @@ impl SCStreamOutputTrait for FrameHandler {
 
         // CVPixelBufferGetIOSurface returns a borrowed IOSurfaceRef (+0).
         // Retain it before the CVPixelBuffer wrapper leaves this callback.
-        let borrowed_surface =
-            unsafe { CVPixelBufferGetIOSurface(pixel_buffer.as_ptr()) };
+        let borrowed_surface = unsafe { CVPixelBufferGetIOSurface(pixel_buffer.as_ptr()) };
         let Some(surface) = (unsafe { IOSurface::from_raw_borrowed(borrowed_surface) }) else {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             return;
