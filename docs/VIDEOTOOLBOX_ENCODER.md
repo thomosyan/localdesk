@@ -1,30 +1,43 @@
-# VideoToolbox encoder milestone
-
-This branch adds the first LocalDesk H.264 encoder wrapper on macOS.
+# VideoToolbox capture and Annex-B recording
 
 ## Current implementation
 
-- Uses Apple's VideoToolbox through the Rust `videotoolbox` crate.
-- Accepts an `IOSurface` directly, matching the IOSurface-backed frames delivered by ScreenCaptureKit.
-- Configures real-time H.264 encoding, target bitrate, expected frame rate, and maximum keyframe interval.
-- Returns the encoder's `EncodedFrame`.
+- Captures display frames through ScreenCaptureKit.
+- Retains each captured IOSurface and sends it through a bounded queue to a dedicated worker.
+- Encodes H.264 using VideoToolbox.
+- Optionally writes encoded access units to an Annex-B `.h264` elementary stream.
 
-## Important limitations
+## Record a test stream
 
-- The encoder wrapper is not connected to the ScreenCaptureKit callback yet.
-- Encoding is synchronous in this wrapper. Call it from a dedicated worker, never directly from the capture callback.
-- `EncodedFrame::data` is AVCC length-prefixed H.264 NAL data, not Annex-B. It is not yet a standalone `.h264` elementary stream.
-- SPS/PPS are available through the encoded sample buffer's format description; parameter-set extraction and AVCC-to-Annex-B conversion are a follow-up task.
-- No UDP/RTP transmission or Windows decoding is added in this milestone.
-
-## Local validation
-
-On an Apple Silicon Mac with Xcode installed:
+On macOS, run:
 
 ```bash
-cargo fmt --all
-cargo check --workspace
-cargo test --workspace
+MACOSX_DEPLOYMENT_TARGET=13.0 cargo run --release -p localdesk-macos-server -- \
+  --width 1920 --height 1080 --fps 60 --seconds 15 --output capture.h264
 ```
 
-Then the next step is a live capture-to-encoder smoke test on macOS. A successful `cargo check` only proves the Rust/API integration compiles; it does not prove that the local VideoToolbox hardware encoder accepts the captured pixel format at runtime.
+The output is raw H.264 Annex-B. It does not contain container timestamps; the current encoder assigns synthetic frame-index timestamps at the configured frame rate. The capture pipeline does not yet preserve ScreenCaptureKit presentation timestamps.
+
+Inspect and decode it with FFmpeg:
+
+```bash
+ffprobe -f h264 -show_streams capture.h264
+ffmpeg -f h264 -framerate 60 -i capture.h264 -f null -
+```
+
+The `-framerate` value must match the configured capture/encoder rate for this test.
+
+## Conversion details
+
+- VideoToolbox returns AVCC length-prefixed NAL units.
+- The writer reads the NAL length-field width from the sample's format description (1, 2, or 4 bytes).
+- NAL units are emitted with four-byte Annex-B start codes.
+- On sync samples, SPS and PPS are taken from the format description and prepended when absent from the access unit.
+- The writer validates truncated prefixes, zero-length NALs, and lengths that exceed the remaining access-unit bytes.
+
+## Current limitations
+
+- No UDP/RTP transmission, packet reassembly, Windows H.264 decoding, or display rendering yet.
+- The raw `.h264` file has no PTS/DTS metadata. A timestamped container or RTP layer is needed to preserve timing.
+- The current frame timestamps are synthetic (`frame_index / fps`), not ScreenCaptureKit capture timestamps.
+- A successful file write does not itself prove independent decoder compatibility; verify with FFmpeg on the captured file.
