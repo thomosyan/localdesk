@@ -73,11 +73,17 @@ mod tests {
     #[test]
     fn parses_mixed_start_codes_without_copying() {
         let stream = [
-            0, 0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x68, 0xce, 0x06,
-            0, 0, 0, 1, 0x65, 0xaa, 0xbb,
+            0, 0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x68, 0xce, 0x06, 0, 0, 0, 1, 0x65, 0xaa, 0xbb,
         ];
         let nals: Vec<&[u8]> = annex_b_nals(&stream).unwrap().collect();
-        assert_eq!(nals, vec![&[0x67, 0x42][..], &[0x68, 0xce, 0x06][..], &[0x65, 0xaa, 0xbb][..]]);
+        assert_eq!(
+            nals,
+            vec![
+                &[0x67, 0x42][..],
+                &[0x68, 0xce, 0x06][..],
+                &[0x65, 0xaa, 0xbb][..]
+            ]
+        );
     }
 
     #[test]

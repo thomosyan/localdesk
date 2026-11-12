@@ -5,7 +5,10 @@ use std::time::Instant;
 use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
-#[command(name = "localdesk-client", about = "LocalDesk Windows receiver prototype")]
+#[command(
+    name = "localdesk-client",
+    about = "LocalDesk Windows receiver prototype"
+)]
 struct Args {
     /// UDP address to listen on, e.g. 0.0.0.0:5004
     #[arg(long, default_value = "0.0.0.0:5004")]
@@ -18,7 +21,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let socket = bind_udp(&args.listen).await?;
     info!(listen = %args.listen, "LocalDesk RTP diagnostic receiver listening");
-    warn!("This build only counts RTP packets. Video decode, rendering and input are not implemented.");
+    warn!(
+        "This build only counts RTP packets. Video decode, rendering and input are not implemented."
+    );
 
     let mut buffer = vec![0u8; 65_535];
     let mut total: u64 = 0;
@@ -32,7 +37,9 @@ async fn main() -> Result<()> {
         if let Some(previous) = last_seq {
             let expected = previous.wrapping_add(1);
             let delta = packet.sequence.wrapping_sub(expected);
-            if delta < 0x8000 { lost_estimate += delta as u64; }
+            if delta < 0x8000 {
+                lost_estimate += delta as u64;
+            }
         }
         last_seq = Some(packet.sequence);
         if last_report.elapsed().as_secs_f64() >= 1.0 {
