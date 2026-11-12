@@ -1,0 +1,8 @@
+/target/
+/build/
+*.avcc
+*.h264
+*.mp4
+.DS_Store
+.env
+*.log

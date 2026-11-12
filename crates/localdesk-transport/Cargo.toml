@@ -1,0 +1,10 @@
+[package]
+name = "localdesk-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+localdesk-protocol = { path = "../localdesk-protocol" }
