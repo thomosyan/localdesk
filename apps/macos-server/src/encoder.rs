@@ -43,11 +43,13 @@ impl H264Encoder {
     pub fn new(config: H264EncoderConfig) -> Result<Self> {
         anyhow::ensure!(
             config.width > 0
+                && config.width <= i32::MAX as u32
                 && config.height > 0
-                && config.fps > 0
+                && config.height <= i32::MAX as u32
+                && (1..=120).contains(&config.fps)
                 && config.bitrate > 0
                 && config.keyframe_interval > 0,
-            "encoder dimensions, fps, bitrate and keyframe interval must be positive"
+            "dimensions must fit i32, fps must be 1..=120, and bitrate/keyframe interval must be positive"
         );
 
         let session = CompressionSession::builder(
