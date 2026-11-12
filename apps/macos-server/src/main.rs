@@ -11,7 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
+use crate::h264_file::extract_access_unit_nals;
+#[cfg(target_os = "macos")]
 use apple_cf::iosurface::IOSurface;
+#[cfg(target_os = "macos")]
+use localdesk_protocol::{RtpPacket, packetize_h264_access_unit};
+#[cfg(target_os = "macos")]
+use localdesk_transport::{bind_udp, send_rtp};
 #[cfg(target_os = "macos")]
 use screencapturekit::cm::CMSampleBuffer;
 #[cfg(target_os = "macos")]
@@ -27,9 +33,9 @@ use std::fs::File;
 #[cfg(target_os = "macos")]
 use std::io::BufWriter;
 #[cfg(target_os = "macos")]
-use std::sync::mpsc::{self, SyncSender, TrySendError};
-#[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 #[cfg(target_os = "macos")]
 use std::thread;
 #[cfg(target_os = "macos")]
@@ -82,6 +88,14 @@ struct Args {
     /// Optional path for an Annex-B H.264 elementary stream (for example capture.h264)
     #[arg(long)]
     output: Option<PathBuf>,
+
+    /// Optional RTP/UDP destination, for example 10.5.1.85:5004
+    #[arg(long)]
+    target: Option<String>,
+
+    /// Maximum RTP packet size in bytes
+    #[arg(long, default_value_t = 1200)]
+    mtu: usize,
 }
 
 #[cfg(target_os = "macos")]
@@ -96,6 +110,9 @@ fn main() -> Result<()> {
     let args = Args::parse();
     if args.width == 0 || args.height == 0 || args.fps == 0 || args.fps > 120 {
         bail!("width/height/fps must be positive; fps must be <= 120");
+    }
+    if !(64..=65_507).contains(&args.mtu) {
+        bail!("--mtu must be between 64 and 65507 bytes");
     }
 
     let content = SCShareableContent::get()
@@ -128,14 +145,82 @@ fn main() -> Result<()> {
     let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
     let worker_stats = Arc::clone(&stats);
     let output_path = args.output.clone();
+    let rtp_mtu = args.mtu;
+    let rtp_fps = args.fps;
+
+    // The UDP thread owns one Tokio runtime and one socket for its lifetime.
+    // The encoder only performs non-blocking sends into this bounded queue.
+    let (rtp_tx, udp_worker) = if let Some(target) = args.target.clone() {
+        let (tx, rx) = mpsc::sync_channel::<Vec<RtpPacket>>(8);
+        let (udp_ready_tx, udp_ready_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
+        let udp_stats = Arc::clone(&stats);
+        let udp_target = target.clone();
+
+        let udp_worker = thread::Builder::new()
+            .name("localdesk-udp-sender".into())
+            .spawn(move || -> Result<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("Could not create UDP Tokio runtime")?;
+
+                let socket = match runtime.block_on(bind_udp("0.0.0.0:0")) {
+                    Ok(socket) => {
+                        let _ = udp_ready_tx.send(Ok(()));
+                        socket
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        let _ = udp_ready_tx.send(Err(message.clone()));
+                        bail!("Could not initialize UDP socket: {message}");
+                    }
+                };
+
+                while let Ok(packets) = rx.recv() {
+                    for packet in packets {
+                        match runtime.block_on(send_rtp(&socket, &udp_target, &packet)) {
+                            Ok(bytes) => {
+                                udp_stats.rtp_packets.fetch_add(1, Ordering::Relaxed);
+                                udp_stats
+                                    .rtp_bytes
+                                    .fetch_add(bytes as u64, Ordering::Relaxed);
+                            }
+                            Err(error) => {
+                                udp_stats.rtp_send_errors.fetch_add(1, Ordering::Relaxed);
+                                error!(%error, "RTP UDP send failed");
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .context("Failed to spawn UDP sender worker")?;
+
+        udp_ready_rx
+            .recv()
+            .context("UDP worker exited before socket initialization")?
+            .map_err(|message| anyhow::anyhow!("UDP initialization failed: {message}"))?;
+
+        info!(destination = %target, mtu = args.mtu, queue_capacity = 8,
+              "RTP/UDP transmission enabled");
+        (Some(tx), Some(udp_worker))
+    } else {
+        info!("RTP/UDP transmission disabled; use --target to enable it");
+        (None, None)
+    };
+
+    let encoder_rtp_tx = rtp_tx.clone();
 
     let encoder_worker = thread::Builder::new()
         .name("localdesk-h264-encoder".into())
         .spawn(move || -> Result<()> {
+            let mut rtp_sequence: u16 = 0;
+            const RTP_SSRC: u32 = 0x4c_44_53_4b;
             let mut output = match output_path {
                 Some(path) => {
-                    let file = File::create(&path)
-                        .with_context(|| format!("Could not create H.264 output file {}", path.display()))?;
+                    let file = File::create(&path).with_context(|| {
+                        format!("Could not create H.264 output file {}", path.display())
+                    })?;
                     info!(path = %path.display(), "Recording Annex-B H.264 elementary stream");
                     Some(H264AnnexBWriter::new(BufWriter::new(file)))
                 }
@@ -165,17 +250,75 @@ fn main() -> Result<()> {
                         match encoder.encode_frame(&surface, frame_index) {
                             Ok(frame) => {
                                 worker_stats.encoded.fetch_add(1, Ordering::Relaxed);
-                                worker_stats.encoded_bytes.fetch_add(
-                                    frame.data.len() as u64,
-                                    Ordering::Relaxed,
-                                );
+                                worker_stats
+                                    .encoded_bytes
+                                    .fetch_add(frame.data.len() as u64, Ordering::Relaxed);
 
                                 if let Some(writer) = output.as_mut() {
-                                    let bytes = writer
-                                        .write_frame(&frame)
-                                        .with_context(|| format!("Failed writing encoded frame {frame_index}"))?;
+                                    let bytes = writer.write_frame(&frame).with_context(|| {
+                                        format!("Failed writing encoded frame {frame_index}")
+                                    })?;
                                     worker_stats.output_frames.fetch_add(1, Ordering::Relaxed);
-                                    worker_stats.output_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                                    worker_stats
+                                        .output_bytes
+                                        .fetch_add(bytes as u64, Ordering::Relaxed);
+                                }
+
+                                if let Some(sender) = encoder_rtp_tx.as_ref() {
+                                    match extract_access_unit_nals(&frame) {
+                                        Ok(nals) => {
+                                            let nal_refs: Vec<&[u8]> =
+                                                nals.iter().map(Vec::as_slice).collect();
+                                            let timestamp = ((frame_index as u128 * 90_000)
+                                                / u128::from(rtp_fps))
+                                                as u32;
+
+                                            match packetize_h264_access_unit(
+                                                &nal_refs,
+                                                rtp_mtu,
+                                                rtp_sequence,
+                                                timestamp,
+                                                RTP_SSRC,
+                                            ) {
+                                                Ok(packets) => {
+                                                    rtp_sequence = rtp_sequence
+                                                        .wrapping_add(packets.len() as u16);
+                                                    worker_stats
+                                                        .rtp_access_units
+                                                        .fetch_add(1, Ordering::Relaxed);
+
+                                                    match sender.try_send(packets) {
+                                                        Ok(()) => {}
+                                                        Err(TrySendError::Full(_)) => {
+                                                            worker_stats
+                                                                .rtp_queue_drops
+                                                                .fetch_add(1, Ordering::Relaxed);
+                                                        }
+                                                        Err(TrySendError::Disconnected(_)) => {
+                                                            worker_stats
+                                                                .rtp_queue_drops
+                                                                .fetch_add(1, Ordering::Relaxed);
+                                                            warn!("UDP sender disconnected");
+                                                        }
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    worker_stats
+                                                        .rtp_packetize_errors
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                    error!(frame_index, %error,
+                                                        "RTP packetization failed");
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            worker_stats
+                                                .rtp_packetize_errors
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            error!(frame_index, %error,
+                                                "Could not extract H.264 NAL units for RTP");
+                                        }
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -252,6 +395,12 @@ fn main() -> Result<()> {
                 encoded_bytes = stats.encoded_bytes.load(Ordering::Relaxed),
                 output_frames = stats.output_frames.load(Ordering::Relaxed),
                 output_bytes = stats.output_bytes.load(Ordering::Relaxed),
+                rtp_access_units = stats.rtp_access_units.load(Ordering::Relaxed),
+                rtp_packets = stats.rtp_packets.load(Ordering::Relaxed),
+                rtp_bytes = stats.rtp_bytes.load(Ordering::Relaxed),
+                rtp_queue_drops = stats.rtp_queue_drops.load(Ordering::Relaxed),
+                rtp_send_errors = stats.rtp_send_errors.load(Ordering::Relaxed),
+                rtp_packetize_errors = stats.rtp_packetize_errors.load(Ordering::Relaxed),
                 measured_fps = format_args!("{fps:.1}"),
                 width = stats.width.load(Ordering::Relaxed),
                 height = stats.height.load(Ordering::Relaxed),
@@ -277,6 +426,15 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("H.264 encoder worker panicked"))?;
     stop_result.context("H.264 encoder worker disconnected before shutdown")?;
     worker_result?;
+
+    // Dropping the final sender closes the queue; the UDP worker drains queued
+    // access units before exiting.
+    drop(rtp_tx);
+    if let Some(worker) = udp_worker {
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("UDP sender worker panicked"))??;
+    }
 
     let total = stats.frames.load(Ordering::Relaxed);
     let encoded = stats.encoded.load(Ordering::Relaxed);
@@ -320,6 +478,12 @@ struct CaptureStats {
     encoded_bytes: AtomicU64,
     output_frames: AtomicU64,
     output_bytes: AtomicU64,
+    rtp_access_units: AtomicU64,
+    rtp_packets: AtomicU64,
+    rtp_bytes: AtomicU64,
+    rtp_queue_drops: AtomicU64,
+    rtp_send_errors: AtomicU64,
+    rtp_packetize_errors: AtomicU64,
 }
 
 #[cfg(target_os = "macos")]

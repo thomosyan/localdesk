@@ -3,9 +3,9 @@
 //! ScreenCaptureKit frames are IOSurface-backed. This wrapper accepts that
 //! IOSurface directly so callers do not need to read pixels back to CPU memory.
 
+use anyhow::Result;
 use apple_cf::cm::CMTime;
 use apple_cf::iosurface::IOSurface;
-use anyhow::Result;
 use videotoolbox::prelude::{Codec, CompressionSession, EncodedFrame};
 
 /// Configuration for a low-latency H.264 compression session.
@@ -57,16 +57,13 @@ impl H264Encoder {
         let bitrate = i32::try_from(config.bitrate)?;
         let keyframe_interval = i32::try_from(config.keyframe_interval)?;
 
-        let session = CompressionSession::builder(
-            config.width as i32,
-            config.height as i32,
-            Codec::H264,
-        )
-        .with_real_time(true)
-        .with_average_bit_rate(bitrate)
-        .with_expected_frame_rate(config.fps as f64)
-        .with_max_keyframe_interval(keyframe_interval)
-        .build()?;
+        let session =
+            CompressionSession::builder(config.width as i32, config.height as i32, Codec::H264)
+                .with_real_time(true)
+                .with_average_bit_rate(bitrate)
+                .with_expected_frame_rate(config.fps as f64)
+                .with_max_keyframe_interval(keyframe_interval)
+                .build()?;
 
         Ok(Self {
             session,

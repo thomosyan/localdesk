@@ -26,7 +26,9 @@ impl<W: Write> H264AnnexBWriter<W> {
             .context("Encoded sample has no format description")?;
         let parameter_sets = format_description
             .video_parameter_sets()
-            .map_err(|status| anyhow::anyhow!("Could not read H.264 parameter sets (OSStatus {status})"))?;
+            .map_err(|status| {
+                anyhow::anyhow!("Could not read H.264 parameter sets (OSStatus {status})")
+            })?;
 
         let length_size = usize::try_from(parameter_sets.nal_unit_header_length)
             .context("Negative AVCC NAL length size")?;
@@ -91,6 +93,63 @@ impl<W: Write> H264AnnexBWriter<W> {
 
 fn nal_type(nal: &[u8]) -> Option<u8> {
     nal.first().map(|header| header & 0x1f)
+}
+
+/// Extracts an H.264 access unit as owned NAL units for RTP packetization.
+///
+/// On sync samples, missing SPS/PPS are prepended from the sample format
+/// description so a receiver can initialize or recover its decoder.
+pub(crate) fn extract_access_unit_nals(frame: &EncodedFrame) -> Result<Vec<Vec<u8>>> {
+    let sample_buffer = frame
+        .cm_sample_buffer()
+        .context("VideoToolbox frame has no CMSampleBuffer")?;
+    let format_description = sample_buffer
+        .format_description()
+        .context("Encoded sample has no format description")?;
+    let parameter_sets = format_description
+        .video_parameter_sets()
+        .map_err(|status| {
+            anyhow::anyhow!("Could not read H.264 parameter sets (OSStatus {status})")
+        })?;
+
+    let length_size = usize::try_from(parameter_sets.nal_unit_header_length)
+        .context("Negative AVCC NAL length size")?;
+    if !matches!(length_size, 1 | 2 | 4) {
+        bail!("Unsupported AVCC NAL length size: {length_size}; expected 1, 2, or 4");
+    }
+
+    let nals = parse_avcc_nals(&frame.data, length_size)?;
+    let mut output: Vec<Vec<u8>> = Vec::with_capacity(nals.len() + 2);
+
+    if sample_buffer.is_sync_sample() {
+        let has_sps = nals.iter().any(|nal| nal_type(nal) == Some(7));
+        let has_pps = nals.iter().any(|nal| nal_type(nal) == Some(8));
+        let mut have_sps = has_sps;
+        let mut have_pps = has_pps;
+
+        for parameter_set in &parameter_sets.parameter_sets {
+            match nal_type(parameter_set) {
+                Some(7) if !have_sps => {
+                    output.push(parameter_set.to_vec());
+                    have_sps = true;
+                }
+                Some(8) if !have_pps => {
+                    output.push(parameter_set.to_vec());
+                    have_pps = true;
+                }
+                _ => {}
+            }
+        }
+
+        if !have_sps || !have_pps {
+            bail!(
+                "Sync sample is missing SPS/PPS (SPS present: {have_sps}, PPS present: {have_pps})"
+            );
+        }
+    }
+
+    output.extend(nals.into_iter().map(|nal| nal.to_vec()));
+    Ok(output)
 }
 
 /// Parses AVCC length-prefixed NAL units without copying their payloads.

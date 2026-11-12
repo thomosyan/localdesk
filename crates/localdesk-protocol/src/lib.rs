@@ -18,6 +18,8 @@ pub enum ProtocolError {
     InvalidHeaderLength,
     #[error("invalid H.264 NAL unit")]
     InvalidNal,
+    #[error("invalid or empty H.264 access unit")]
+    InvalidAccessUnit,
     #[error("MTU must be larger than RTP header plus FU-A overhead")]
     MtuTooSmall,
     #[error("unsupported H.264 aggregation/fragmentation packet")]
@@ -93,8 +95,9 @@ impl RtpPacket {
     }
 }
 
-/// Packetize one Annex-B-independent H.264 NAL unit (without 00 00 01 prefix).
+/// Packetize one Annex-B-independent H.264 NAL unit.
 /// Uses RFC 6184 single-NAL packets or FU-A fragmentation.
+/// The NAL is treated as a complete access unit for marker-bit purposes.
 pub fn packetize_h264_nal(
     nal: &[u8],
     mtu: usize,
@@ -102,16 +105,58 @@ pub fn packetize_h264_nal(
     timestamp: u32,
     ssrc: u32,
 ) -> Result<Vec<RtpPacket>, ProtocolError> {
+    packetize_h264_nal_inner(nal, mtu, first_sequence, timestamp, ssrc, true)
+}
+
+/// Packetize all NAL units belonging to one H.264 access unit.
+///
+/// Sequence numbers are continuous across NAL units. The RTP marker bit is
+/// set only on the final packet of the final NAL unit in the access unit.
+pub fn packetize_h264_access_unit(
+    nals: &[&[u8]],
+    mtu: usize,
+    first_sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
+) -> Result<Vec<RtpPacket>, ProtocolError> {
+    if nals.is_empty() || nals.iter().any(|nal| nal.is_empty()) {
+        return Err(ProtocolError::InvalidAccessUnit);
+    }
+
+    let mut packets = Vec::new();
+    let mut next_sequence = first_sequence;
+
+    for (index, nal) in nals.iter().enumerate() {
+        let is_last_nal = index == nals.len() - 1;
+        let mut nal_packets =
+            packetize_h264_nal_inner(nal, mtu, next_sequence, timestamp, ssrc, is_last_nal)?;
+
+        next_sequence = next_sequence.wrapping_add(nal_packets.len() as u16);
+        packets.append(&mut nal_packets);
+    }
+
+    Ok(packets)
+}
+
+fn packetize_h264_nal_inner(
+    nal: &[u8],
+    mtu: usize,
+    first_sequence: u16,
+    timestamp: u32,
+    ssrc: u32,
+    mark_last_packet: bool,
+) -> Result<Vec<RtpPacket>, ProtocolError> {
     if nal.is_empty() {
         return Err(ProtocolError::InvalidNal);
     }
     if mtu <= RTP_HEADER_LEN + 2 {
         return Err(ProtocolError::MtuTooSmall);
     }
+
     let max_payload = mtu - RTP_HEADER_LEN;
     if nal.len() <= max_payload {
         return Ok(vec![RtpPacket {
-            marker: true,
+            marker: mark_last_packet,
             payload_type: H264_PAYLOAD_TYPE,
             sequence: first_sequence,
             timestamp,
@@ -121,11 +166,12 @@ pub fn packetize_h264_nal(
     }
 
     let nal_header = nal[0];
-    let indicator = (nal_header & 0xe0) | 28; // FU-A, preserve F and NRI
+    let indicator = (nal_header & 0xe0) | 28;
     let nal_type = nal_header & 0x1f;
     let chunk_size = max_payload - 2;
     let chunks: Vec<&[u8]> = nal[1..].chunks(chunk_size).collect();
     let mut packets = Vec::with_capacity(chunks.len());
+
     for (i, chunk) in chunks.iter().enumerate() {
         let start = i == 0;
         let end = i == chunks.len() - 1;
@@ -134,8 +180,9 @@ pub fn packetize_h264_nal(
         payload.put_u8(indicator);
         payload.put_u8(fu_header);
         payload.extend_from_slice(chunk);
+
         packets.push(RtpPacket {
-            marker: end,
+            marker: end && mark_last_packet,
             payload_type: H264_PAYLOAD_TYPE,
             sequence: first_sequence.wrapping_add(i as u16),
             timestamp,
@@ -143,6 +190,7 @@ pub fn packetize_h264_nal(
             payload: payload.freeze(),
         });
     }
+
     Ok(packets)
 }
 
@@ -213,6 +261,65 @@ mod tests {
         let nal = [0x65, 1, 2, 3, 4];
         let packets = packetize_h264_nal(&nal, 1200, 10, 99, 7).unwrap();
         assert_eq!(depacketize_h264_nal(&packets).unwrap().as_ref(), nal);
+    }
+
+    #[test]
+    fn access_unit_marks_only_final_single_nal_packet() {
+        let nals: [&[u8]; 3] = [&[0x67, 1], &[0x68, 2], &[0x65, 3]];
+        let packets = packetize_h264_access_unit(&nals, 1200, 10, 99, 7).unwrap();
+
+        assert_eq!(packets.len(), 3);
+        assert_eq!(
+            packets.iter().map(|p| p.marker).collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+        assert_eq!(
+            packets.iter().map(|p| p.sequence).collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn access_unit_marks_only_last_fragment_of_last_nal() {
+        let first_nal = [0x67, 1, 2];
+        let mut last_nal = vec![0x65];
+        last_nal.extend(0..100);
+
+        let nals: [&[u8]; 2] = [&first_nal, &last_nal];
+        let packets = packetize_h264_access_unit(&nals, 32, 100, 99, 7).unwrap();
+
+        assert!(packets.len() > 2);
+        assert!(packets.iter().all(|p| p.timestamp == 99));
+        assert!(packets.last().unwrap().marker);
+        assert!(packets[..packets.len() - 1].iter().all(|p| !p.marker));
+
+        for pair in packets.windows(2) {
+            assert_eq!(pair[1].sequence, pair[0].sequence.wrapping_add(1));
+        }
+    }
+
+    #[test]
+    fn access_unit_sequence_numbers_wrap() {
+        let nals: [&[u8]; 3] = [&[0x67], &[0x68], &[0x65]];
+        let packets = packetize_h264_access_unit(&nals, 1200, 65534, 1, 2).unwrap();
+
+        assert_eq!(
+            packets.iter().map(|p| p.sequence).collect::<Vec<_>>(),
+            vec![65534, 65535, 0]
+        );
+        assert!(packets.last().unwrap().marker);
+    }
+
+    #[test]
+    fn access_unit_rejects_empty_input_and_empty_nals() {
+        assert_eq!(
+            packetize_h264_access_unit(&[], 1200, 0, 0, 0).unwrap_err(),
+            ProtocolError::InvalidAccessUnit
+        );
+        assert_eq!(
+            packetize_h264_access_unit(&[&[0x65], &[]], 1200, 0, 0, 0).unwrap_err(),
+            ProtocolError::InvalidAccessUnit
+        );
     }
 
     #[test]
