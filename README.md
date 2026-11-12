@@ -1,3 +1,4 @@
+
 # LocalDesk
 
 Локальный удалённый рабочий стол **macOS (Apple Silicon) → Windows 10/11**.
@@ -84,3 +85,6 @@ cargo run -p localdesk-macos-server --target aarch64-apple-darwin -- \
 
 This milestone validates capture and frame cadence only. VideoToolbox encoding,
 RTP transmission, input injection, and the GUI are still subsequent milestones.
+
+# localdesk
+Native cross-platform remote desktop in Rust
