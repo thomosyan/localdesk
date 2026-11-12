@@ -11,3 +11,8 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = "11.1.2"
+apple-cf = { version = "0.11", default-features = false, features = ["cm", "iosurface"] }
+videotoolbox = "0.21"
+localdesk-protocol = { path = "../../crates/localdesk-protocol" }
+localdesk-transport = { path = "../../crates/localdesk-transport" }
+tokio.workspace = true

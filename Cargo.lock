@@ -194,10 +194,15 @@ name = "localdesk-macos-server"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "apple-cf",
  "clap",
+ "localdesk-protocol",
+ "localdesk-transport",
  "screencapturekit",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "videotoolbox",
 ]
 
 [[package]]
@@ -579,6 +584,16 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "videotoolbox"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13cf2b8b5472d2da9a812f2cf8a40081ed9cf6633733cff6a5139a360aa11a36"
+dependencies = [
+ "apple-cf",
+ "doom-fish-utils",
+]
 
 [[package]]
 name = "wasi"
