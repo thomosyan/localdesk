@@ -48,9 +48,14 @@ impl H264Encoder {
                 && config.height <= i32::MAX as u32
                 && (1..=120).contains(&config.fps)
                 && config.bitrate > 0
-                && config.keyframe_interval > 0,
-            "dimensions must fit i32, fps must be 1..=120, and bitrate/keyframe interval must be positive"
+                && config.bitrate <= i32::MAX as u32
+                && config.keyframe_interval > 0
+                && config.keyframe_interval <= i32::MAX as u32,
+            "dimensions, bitrate and keyframe interval must fit i32; fps must be 1..=120"
         );
+
+        let bitrate = i32::try_from(config.bitrate)?;
+        let keyframe_interval = i32::try_from(config.keyframe_interval)?;
 
         let session = CompressionSession::builder(
             config.width as i32,
@@ -58,9 +63,9 @@ impl H264Encoder {
             Codec::H264,
         )
         .with_real_time(true)
-        .with_average_bit_rate(config.bitrate)
+        .with_average_bit_rate(bitrate)
         .with_expected_frame_rate(config.fps as f64)
-        .with_max_keyframe_interval(config.keyframe_interval)
+        .with_max_keyframe_interval(keyframe_interval)
         .build()?;
 
         Ok(Self {
